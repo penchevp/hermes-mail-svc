@@ -78,6 +78,8 @@ func (app *App) Run() {
 	// sync data into own db
 	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.public.customers"), customerFetchMessageChan, customerCommitMessageChan)
 	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.public.customer_notification_channels"), customerNotificationChannelsFetchMessageChan, customerNotificationChannelsCommitMessageChan)
+
+	// support retry for failed delivery
 	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.mail.retry-queue"), retryQueueFetchMessageChan, retryQueueCommitMessageChan)
 
 	// process any new notifications within the consumer group ignoring the past
