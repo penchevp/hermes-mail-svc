@@ -32,6 +32,11 @@ func Send(config Config, recipient string, body string) error {
 		Credentials: credentials.NewStaticCredentials(config.AccessKeyID, config.SecretAccessKey, ""),
 	})
 
+	if err != nil {
+		log.Err(err).Msg("Could not create AWS session")
+		return err
+	}
+
 	// Create an SES session.
 	svc := ses.New(sess)
 
