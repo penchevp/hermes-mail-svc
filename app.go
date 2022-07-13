@@ -43,6 +43,11 @@ type Notification struct {
 	Text string `json:"text"`
 }
 
+type NotificationModel struct {
+	Text         string `json:"text"`
+	EmailAddress string `json:"email_address"`
+}
+
 func (app *App) Initialize(ctx context.Context, dbConfig db.Config, mailerConfig mailer.Config) {
 	err := db.InitialiseConnection(dbConfig)
 	if err != nil {
@@ -67,10 +72,13 @@ func (app *App) Run() {
 	customerNotificationChannelsCommitMessageChan := make(chan kafka.Message, 0)
 	notificationsFetchMessageChan := make(chan kafka.Message, 0)
 	notificationsCommitMessageChan := make(chan kafka.Message, 0)
+	retryQueueFetchMessageChan := make(chan kafka.Message, 0)
+	retryQueueCommitMessageChan := make(chan kafka.Message, 0)
 
 	// sync data into own db
 	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.public.customers"), customerFetchMessageChan, customerCommitMessageChan)
 	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.public.customer_notification_channels"), customerNotificationChannelsFetchMessageChan, customerNotificationChannelsCommitMessageChan)
+	go readKafka(app.ctx, withTopic(standardKafkaConfig(), "hermes.mail.retry-queue"), retryQueueFetchMessageChan, retryQueueCommitMessageChan)
 
 	// process any new notifications within the consumer group ignoring the past
 	go readKafka(app.ctx, withOffset(withTopic(standardKafkaConfig(), "hermes.public.notifications"), kafka.LastOffset), notificationsFetchMessageChan, notificationsCommitMessageChan)
@@ -131,6 +139,20 @@ func (app *App) Run() {
 					err = notificationsProcessor(app.ctx, app.mailerConfig, dbConn, connectJson)
 					if err == nil {
 						notificationsCommitMessageChan <- m
+					}
+				}
+			case m := <-retryQueueFetchMessageChan:
+				{
+					var model NotificationModel
+
+					err = json.Unmarshal(m.Value, &model)
+					if err != nil {
+						continue
+					}
+
+					err = retryNotificationsProcessor(app.mailerConfig, model)
+					if err == nil {
+						retryQueueCommitMessageChan <- m
 					}
 				}
 			}
@@ -201,24 +223,44 @@ func notificationsProcessor(ctx context.Context, mailerConfig mailer.Config, dbC
 			go func() {
 				err := mailer.Send(mailerConfig, customer.EmailAddress, connectJson.After.Text)
 				if err != nil {
-					// TODO:
-					// write in a retry topic to read from within this service to ensure no notification is ever lost
+					w := &kafka.Writer{
+						Addr:                   kafka.TCP("localhost:29092"),
+						Topic:                  "hermes.mail.retry-queue",
+						AllowAutoTopicCreation: true,
+					}
 
-					//w := &kafka.Writer{
-					//	Topic: "hermes.mail.retry-queue",
-					//}
-					//
-					//err := w.WriteMessages(ctx,
-					//	kafka.Message{
-					//		Key:   []byte("Key-A"),
-					//		Value: []byte("Hello World!"),
-					//	},
-					//)
+					notificationModel := NotificationModel{EmailAddress: customer.EmailAddress, Text: connectJson.After.Text}
+					notificationModelBytes, _ := json.Marshal(notificationModel)
+
+					err := w.WriteMessages(ctx,
+						kafka.Message{
+							Value: notificationModelBytes,
+						},
+					)
+
+					if err != nil {
+						log.Err(err).
+							Msg("Unable to insert failed notification into retry queue")
+					}
 				}
 			}()
 
 			// artificial delay so AWS won't cut us off
 			time.Sleep(1 * time.Second)
+		}
+	}
+
+	return nil
+}
+
+func retryNotificationsProcessor(mailerConfig mailer.Config, model NotificationModel) error {
+	if len(model.Text) > 0 && len(model.EmailAddress) > 0 {
+		err := mailer.Send(mailerConfig, model.EmailAddress, model.Text)
+		if err != nil {
+			log.Err(err).
+				Msg("Unable to process a notification from the retry queue")
+
+			return err
 		}
 	}
 
